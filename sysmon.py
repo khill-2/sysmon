@@ -12,7 +12,11 @@ import os
 from datetime import datetime, timedelta
 from collections import deque
 
-HISTORY_LEN = 50
+HISTORY_LEN    = 50
+CPU_HOG_THRESH = 20.0   # %
+MEM_HOG_THRESH = 3.0    # %
+DUPE_COUNT_MIN = 3      # instances of same name
+DUPE_RSS_MIN   = 200 * 1024 * 1024  # combined RSS bytes
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +74,104 @@ def pct_color(pct, C):
         return C[3]
     return C[4]
 
+def find_hogs(procs):
+    seen_pids = set()
+    candidates = []
+
+    for p in procs:
+        pid = p.get('pid')
+        if p.get('status') == 'zombie' and pid not in seen_pids:
+            candidates.append({'reason': 'ZOMBIE', 'pids': [pid], 'proc': p})
+            seen_pids.add(pid)
+
+    for p in procs:
+        pid = p.get('pid')
+        if (p.get('cpu_percent') or 0) > CPU_HOG_THRESH and pid not in seen_pids:
+            candidates.append({'reason': 'CPU HOG', 'pids': [pid], 'proc': p})
+            seen_pids.add(pid)
+
+    for p in procs:
+        pid = p.get('pid')
+        if (p.get('memory_percent') or 0) > MEM_HOG_THRESH and pid not in seen_pids:
+            candidates.append({'reason': 'MEM HOG', 'pids': [pid], 'proc': p})
+            seen_pids.add(pid)
+
+    # Duplicate process groups — keep lowest PID, flag rest
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for p in procs:
+        groups[p.get('name') or ''].append(p)
+    for name, group in groups.items():
+        if len(group) < DUPE_COUNT_MIN:
+            continue
+        rss_list = [p['memory_info'].rss for p in group if p.get('memory_info')]
+        if sum(rss_list) < DUPE_RSS_MIN:
+            continue
+        group.sort(key=lambda p: p.get('pid') or 0)
+        kill_group = group[1:]
+        pids = [p['pid'] for p in kill_group if p.get('pid') not in seen_pids]
+        if pids:
+            candidates.append({
+                'reason': f'DUPE×{len(group)}',
+                'pids': pids,
+                'proc': group[0],
+                'combined_rss': sum(rss_list),
+            })
+            seen_pids.update(pids)
+
+    return candidates
+
+def draw_sweep(win, candidates, sweep_sel, sweep_checked, C, max_y, max_x):
+    if not candidates:
+        msg = "  No hogs found — system looks clean  "
+        w = len(msg) + 2
+        y = max_y // 2 - 1
+        x = max(0, (max_x - w) // 2)
+        attr = C[2] | curses.A_REVERSE | curses.A_BOLD
+        safe_addstr(win, y,     x, ' ' * w, attr)
+        safe_addstr(win, y + 1, x, msg,     attr)
+        safe_addstr(win, y + 2, x, ' ' * w, attr)
+        safe_addstr(win, y + 3, x, '  [n] close  '.center(w), attr)
+        return
+
+    title = f" HOG SWEEP — {len(candidates)} candidates "
+    w    = max(len(title) + 4, min(max_x - 4, 72))
+    h    = len(candidates) + 5
+    y0   = max(1, max_y // 2 - h // 2)
+    x0   = max(0, (max_x - w) // 2)
+
+    for dy in range(h):
+        safe_addstr(win, y0 + dy, x0, ' ' * w, C[1] | curses.A_REVERSE)
+
+    safe_addstr(win, y0,     x0, title.center(w), C[5] | curses.A_REVERSE | curses.A_BOLD)
+    safe_addstr(win, y0 + 1, x0, '─' * w,         C[6] | curses.A_REVERSE)
+
+    for i, cand in enumerate(candidates):
+        r      = y0 + 2 + i
+        check  = '✓' if i in sweep_checked else ' '
+        reason = cand['reason'][:8]
+        name   = (cand['proc'].get('name') or '?')[:16]
+        cpu_p  = cand['proc'].get('cpu_percent') or 0
+        mem_p  = cand['proc'].get('memory_percent') or 0
+        if 'combined_rss' in cand:
+            detail = f"combined {b2h(cand['combined_rss'])}, {len(cand['pids'])} procs"
+        else:
+            detail = f"PID {cand['pids'][0]}  CPU {cpu_p:.1f}%  MEM {mem_p:.1f}%"
+        line = f" [{check}] {reason:<8}  {name:<16}  {detail}"
+        if i == sweep_sel:
+            attr = C[8] | curses.A_BOLD
+        elif i in sweep_checked:
+            attr = C[4] | curses.A_REVERSE
+        else:
+            attr = C[1] | curses.A_REVERSE
+        safe_addstr(win, r, x0, line[:w].ljust(w), attr)
+
+    fr = y0 + 2 + len(candidates)
+    safe_addstr(win, fr,     x0, '─' * w, C[6] | curses.A_REVERSE)
+    safe_addstr(win, fr + 1, x0,
+                ' [↑↓] nav  [space] toggle  [a] all  [k] kill checked  [n] cancel '.center(w),
+                C[5] | curses.A_REVERSE | curses.A_BOLD)
+
 def divider(win, row, label, C, max_x):
     pad = max(0, max_x - len(label) - 4)
     safe_addstr(win, row, 0, f"── {label} " + "─" * pad, C[6])
@@ -119,9 +221,13 @@ def main(stdscr):
     selected = 0
     scroll = 0
     sort_key = 'cpu'
-    pending_kill = None
-    kill_sig = None
-    kill_err = None
+    pending_kill  = None
+    kill_sig      = None
+    kill_err      = None
+    sweep_mode    = False
+    sweep_cands   = []
+    sweep_sel     = 0
+    sweep_checked = set()
     procs = []
 
     prev_net = psutil.net_io_counters()
@@ -134,7 +240,34 @@ def main(stdscr):
     while True:
         key = stdscr.getch()
 
-        if pending_kill is not None:
+        if sweep_mode:
+            if key == curses.KEY_DOWN:
+                sweep_sel = min(sweep_sel + 1, len(sweep_cands) - 1)
+            elif key == curses.KEY_UP:
+                sweep_sel = max(sweep_sel - 1, 0)
+            elif key == ord(' '):
+                if sweep_sel in sweep_checked:
+                    sweep_checked.discard(sweep_sel)
+                else:
+                    sweep_checked.add(sweep_sel)
+            elif key == ord('a'):
+                if sweep_checked == set(range(len(sweep_cands))):
+                    sweep_checked.clear()
+                else:
+                    sweep_checked = set(range(len(sweep_cands)))
+            elif key == ord('k') and sweep_checked:
+                for i in sweep_checked:
+                    for pid in sweep_cands[i]['pids']:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                sweep_mode = False
+                sweep_checked.clear()
+            elif key in (ord('n'), 27):
+                sweep_mode = False
+                sweep_checked.clear()
+        elif pending_kill is not None:
             if key == ord('y'):
                 try:
                     os.kill(pending_kill['pid'], kill_sig)
@@ -163,6 +296,11 @@ def main(stdscr):
             elif key == ord('t'):
                 selected = 0
                 scroll = 0
+            elif key == ord('H'):
+                sweep_cands   = find_hogs(procs)
+                sweep_sel     = 0
+                sweep_checked = set()
+                sweep_mode    = True
             elif key == ord('k') and procs:
                 pending_kill = procs[selected].copy()
                 kill_sig = signal.SIGTERM
@@ -340,11 +478,13 @@ def main(stdscr):
                 row += 1
 
         # ── Footer ────────────────────────────────────────────────────────
-        footer = "  [q] quit   [↑↓] scroll   [t] top   [k] kill   [K] SIGKILL   [c/m/p/n] sort  "
+        footer = "  [q] quit   [↑↓] scroll   [t] top   [k] kill   [K] SIGKILL   [H] hog sweep   [c/m/p/n] sort  "
         safe_addstr(stdscr, max_y - 1, 0, footer.ljust(max_x),
                     C[5] | curses.A_REVERSE)
 
-        if pending_kill is not None:
+        if sweep_mode:
+            draw_sweep(stdscr, sweep_cands, sweep_sel, sweep_checked, C, max_y, max_x)
+        elif pending_kill is not None:
             draw_kill_confirm(stdscr, pending_kill, kill_sig, kill_err, C, max_y, max_x)
 
         stdscr.refresh()
