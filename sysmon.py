@@ -6,9 +6,9 @@ Run: python3 ~/sysmon.py
 
 import curses
 import psutil
+import signal
 import time
 import os
-import sys
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -74,6 +74,22 @@ def divider(win, row, label, C, max_x):
     pad = max(0, max_x - len(label) - 4)
     safe_addstr(win, row, 0, f"── {label} " + "─" * pad, C[6])
 
+def draw_kill_confirm(win, proc, sig, err, C, max_y, max_x):
+    name = (proc.get('name') or '?')[:30]
+    pid  = proc.get('pid', 0)
+    sig_name = 'SIGKILL' if sig == signal.SIGKILL else 'SIGTERM'
+    if err:
+        body = f" Error: {err[:50]} "
+    else:
+        body = f" Kill {name} (PID {pid}) with {sig_name}?  [y] yes  [n] cancel "
+    w = len(body) + 2
+    y = max_y // 2 - 1
+    x = max(0, (max_x - w) // 2)
+    attr = C[4] | curses.A_REVERSE | curses.A_BOLD
+    safe_addstr(win, y,     x, ' ' * w, attr)
+    safe_addstr(win, y + 1, x, body,    attr)
+    safe_addstr(win, y + 2, x, ' ' * w, attr)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(stdscr):
@@ -103,6 +119,10 @@ def main(stdscr):
     selected = 0
     scroll = 0
     sort_key = 'cpu'
+    pending_kill = None
+    kill_sig = None
+    kill_err = None
+    procs = []
 
     prev_net = psutil.net_io_counters()
     prev_t = time.time()
@@ -113,23 +133,44 @@ def main(stdscr):
 
     while True:
         key = stdscr.getch()
-        if key in (ord('q'), 27):
-            break
-        elif key == curses.KEY_DOWN:
-            selected += 1
-        elif key == curses.KEY_UP:
-            selected = max(0, selected - 1)
-        elif key == ord('c'):
-            sort_key = 'cpu'
-        elif key == ord('m'):
-            sort_key = 'mem'
-        elif key == ord('p'):
-            sort_key = 'pid'
-        elif key == ord('n'):
-            sort_key = 'name'
-        elif key == ord('t'):
-            selected = 0
-            scroll = 0
+
+        if pending_kill is not None:
+            if key == ord('y'):
+                try:
+                    os.kill(pending_kill['pid'], kill_sig)
+                except (ProcessLookupError, PermissionError) as e:
+                    kill_err = str(e)
+                else:
+                    pending_kill = None
+            elif key in (ord('n'), 27):
+                pending_kill = None
+                kill_err = None
+        else:
+            if key in (ord('q'), 27):
+                break
+            elif key == curses.KEY_DOWN:
+                selected += 1
+            elif key == curses.KEY_UP:
+                selected = max(0, selected - 1)
+            elif key == ord('c'):
+                sort_key = 'cpu'
+            elif key == ord('m'):
+                sort_key = 'mem'
+            elif key == ord('p'):
+                sort_key = 'pid'
+            elif key == ord('n'):
+                sort_key = 'name'
+            elif key == ord('t'):
+                selected = 0
+                scroll = 0
+            elif key == ord('k') and procs:
+                pending_kill = procs[selected].copy()
+                kill_sig = signal.SIGTERM
+                kill_err = None
+            elif key == ord('K') and procs:
+                pending_kill = procs[selected].copy()
+                kill_sig = signal.SIGKILL
+                kill_err = None
 
         max_y, max_x = stdscr.getmaxyx()
         if max_x < 60 or max_y < 15:
@@ -299,9 +340,12 @@ def main(stdscr):
                 row += 1
 
         # ── Footer ────────────────────────────────────────────────────────
-        footer = "  [q] quit   [↑↓] scroll   [t] top   [c] sort cpu   [m] sort mem   [p] sort pid   [n] sort name  "
+        footer = "  [q] quit   [↑↓] scroll   [t] top   [k] kill   [K] SIGKILL   [c/m/p/n] sort  "
         safe_addstr(stdscr, max_y - 1, 0, footer.ljust(max_x),
                     C[5] | curses.A_REVERSE)
+
+        if pending_kill is not None:
+            draw_kill_confirm(stdscr, pending_kill, kill_sig, kill_err, C, max_y, max_x)
 
         stdscr.refresh()
 
