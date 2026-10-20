@@ -228,6 +228,8 @@ def main(stdscr):
     sweep_cands   = []
     sweep_sel     = 0
     sweep_checked = set()
+    search_mode   = False
+    search_query  = ''
     procs = []
 
     prev_net = psutil.net_io_counters()
@@ -240,7 +242,20 @@ def main(stdscr):
     while True:
         key = stdscr.getch()
 
-        if sweep_mode:
+        if search_mode:
+            if key in (27, curses.KEY_F3):  # ESC clears and exits
+                search_mode  = False
+                search_query = ''
+                selected = 0
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                search_query = search_query[:-1]
+                selected = 0
+            elif key == 10:  # Enter — lock in filter, exit typing mode
+                search_mode = False
+            elif 32 <= key <= 126:
+                search_query += chr(key)
+                selected = 0
+        elif sweep_mode:
             if key == curses.KEY_DOWN:
                 sweep_sel = min(sweep_sel + 1, len(sweep_cands) - 1)
             elif key == curses.KEY_UP:
@@ -296,6 +311,10 @@ def main(stdscr):
             elif key == ord('t'):
                 selected = 0
                 scroll = 0
+            elif key == ord('/'):
+                search_mode  = True
+                search_query = ''
+                selected = 0
             elif key == ord('H'):
                 sweep_cands   = find_hogs(procs)
                 sweep_sel     = 0
@@ -352,6 +371,11 @@ def main(stdscr):
                 procs.append(p.info)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
+        if search_query:
+            q = search_query.lower()
+            procs = [p for p in procs if q in (p.get('name') or '').lower()
+                                          or q in str(p.get('pid', ''))]
 
         procs.sort(key=lambda x: (-(x.get('cpu_percent') or 0) if sort_key == 'cpu'
                                    else -(x.get('memory_percent') or 0) if sort_key == 'mem'
@@ -427,8 +451,9 @@ def main(stdscr):
 
         # ── Processes ─────────────────────────────────────────────────────
         if row < max_y - 4:
+            filter_tag = f'  filter: "{search_query}{"█" if search_mode else ""}"' if search_query or search_mode else ''
             divider(stdscr, row,
-                    f"PROCESSES  {len(procs)} total  [sort: {sort_key.upper()}  c/m/p/n]",
+                    f"PROCESSES  {len(procs)} total  [sort: {sort_key.upper()}]{filter_tag}",
                     C, max_x)
             row += 1
 
@@ -478,7 +503,7 @@ def main(stdscr):
                 row += 1
 
         # ── Footer ────────────────────────────────────────────────────────
-        footer = "  [q] quit   [↑↓] scroll   [t] top   [k] kill   [K] SIGKILL   [H] hog sweep   [c/m/p/n] sort  "
+        footer = "  [q] quit   [↑↓] scroll   [t] top   [/] search   [k] kill   [K] SIGKILL   [H] hog sweep   [c/m/p/n] sort  "
         safe_addstr(stdscr, max_y - 1, 0, footer.ljust(max_x),
                     C[5] | curses.A_REVERSE)
 
