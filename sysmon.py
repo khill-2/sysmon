@@ -294,8 +294,14 @@ def main(stdscr):
                 pending_kill = None
                 kill_err = None
         else:
-            if key in (ord('q'), 27):
+            if key == ord('q'):
                 break
+            elif key == 27:
+                if search_query:
+                    search_query = ''
+                    selected = 0
+                else:
+                    break
             elif key == curses.KEY_DOWN:
                 selected += 1
             elif key == curses.KEY_UP:
